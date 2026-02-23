@@ -23,37 +23,114 @@ const App: React.FC = () => {
     const [foodOptions, setFoodOptions] = useState<string[]>([]);
     const [showWaiterButton, setShowWaiterButton] = useState(false);
     const [waiterActive, setWaiterActive] = useState(false);
+    const [waiterLang, setWaiterLang] = useState('hi');
+    const [placeholderImages, setPlaceholderImages] = useState<string[]>([]);
+    const [agentSpeaking, setAgentSpeaking] = useState(false);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+
+    // Load speech synthesis voices
+    useEffect(() => {
+        if (window.speechSynthesis) {
+            // Load voices (they may not be ready immediately)
+            window.speechSynthesis.getVoices();
+            window.speechSynthesis.onvoiceschanged = () => {
+                const voices = window.speechSynthesis.getVoices();
+                console.log('[TTS] Voices loaded:', voices.length);
+            };
+        }
+    }, []);
 
     // Auto-scroll chat
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [history]);
 
-    // WebSocket setup
+    // WebSocket setup with auto-reconnect
     useEffect(() => {
-        const socket = new WebSocket(`ws://localhost:8080/ws/${sessionId}`);
-        socket.onopen = () => setWsConnected(true);
-        socket.onclose = () => setWsConnected(false);
-        socket.onerror = () => setWsConnected(false);
-        socket.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            handleServerPayload(data);
+        console.log('[WS] ======== WebSocket initialization (with reconnect) ========');
+        console.log('[WS] Session ID:', sessionId);
+
+        let cancelled = false;
+        let backoff = 500; // ms
+
+        const connect = () => {
+            if (cancelled) return;
+            console.log('[WS] Attempting websocket connection... backoff=', backoff);
+            const socket = new WebSocket(`ws://localhost:8080/ws/${sessionId}`);
+
+            socket.onopen = () => {
+                console.log('[WS] ✓✓✓ CONNECTED ✓✓✓');
+                console.log('[WS] ReadyState:', socket.readyState, '(1=OPEN)');
+                setWs(socket);
+                setWsConnected(true);
+                backoff = 500; // reset
+            };
+
+            socket.onclose = (event) => {
+                console.log('[WS] ❌❌❌ CLOSED ❌❌❌');
+                console.log('[WS] Code:', event.code);
+                console.log('[WS] Reason:', event.reason || 'No reason provided');
+                console.log('[WS] Clean:', event.wasClean);
+                setWsConnected(false);
+                setWs(null);
+                if (!cancelled) {
+                    // exponential backoff up to 5s
+                    setTimeout(() => {
+                        backoff = Math.min(5000, backoff * 2);
+                        connect();
+                    }, backoff);
+                }
+            };
+
+            socket.onerror = (error) => {
+                console.error('[WS] ✗✗✗ ERROR ✗✗✗', error);
+                console.log('[WS] ReadyState:', socket.readyState);
+                setWsConnected(false);
+            };
+
+            socket.onmessage = (event) => {
+                // Handle payloads (attempt to parse JSON)
+                try {
+                    const data = JSON.parse(event.data);
+                    handleServerPayload(data);
+                } catch (parseError) {
+                    console.error('[WS] ✗ JSON parse error:', parseError);
+                }
+            };
         };
-        setWs(socket);
-        return () => socket.close();
+
+        connect();
+
+        return () => {
+            cancelled = true;
+            console.log('[WS] ======== Cleanup: closing socket ========');
+            ws?.close();
+            setWs(null);
+        };
     }, [sessionId]);
 
     // ---------- Payload handler (shared by HTTP + WS) ----------
     const handleServerPayload = useCallback((data: any) => {
+        console.log('[App.handleServerPayload] ========================================');
+        console.log('[App.handleServerPayload] Received from backend:', data);
         const botText: string = data.bot_response || '';
         const providerReply: string = data.bot_response_to_provider || '';
         const userSummary: string = data.user_summary || botText;
         const signal: string = data.signal || '';
+        const items: string[] = data.items || [];
         const options: string[] = data.food_options || [];
         const voiceAudio: string | undefined = data.voice_audio;
-        const waiterLang: string = data.waiter_lang || 'en';
+        const waiterLang: string = data.waiter_lang || 'hi';
+        console.log('[App.handleServerPayload] Extracted:');
+        console.log('  - providerReply:', providerReply);
+        console.log('  - userSummary:', userSummary);
+        console.log('  - signal:', signal);
+        console.log('  - voiceAudio:', voiceAudio ? `${voiceAudio.length} chars` : 'none');
+        console.log('  - waiterLang:', waiterLang);
+
+        // Keep waiterLang in sync
+        if (data.waiter_lang) setWaiterLang(data.waiter_lang);
 
         // Update chat: Use English summary for the user
         if (userSummary) {
@@ -71,50 +148,112 @@ const App: React.FC = () => {
         }
 
         // Handle signals
-        if (signal === 'SHOW_WAITER_BUTTON') {
+        console.log('[handleServerPayload] Received signal:', signal);
+        
+        if (signal === 'SHOW_WAITER_BUTTON' || signal === 'SHOW_PROVIDER_BUTTON') {
+            console.log('[handleServerPayload] Showing provider button');
             setShowWaiterButton(true);
             setWaiterActive(false);
+            setPlaceholderImages([]);
+            setFoodOptions([]);
         }
+        
         if (signal === 'WAITER_ACTIVE') {
+            console.log('[handleServerPayload] Activating waiter mode');
             setWaiterActive(true);
             setShowWaiterButton(false);
         }
-        if (signal === 'SHOW_FOODS' || signal === 'SHOW_MENU_IMAGES' || signal === 'SHOW_PLACEHOLDER_IMAGES') {
-            const finalOptions = data.items || data.menu_items || options;
-            setFoodOptions(finalOptions);
-            setShowWaiterButton(false);
-            setWaiterActive(true);
-        }
-        if (signal === 'WORK_DONE' || data.status === 'done') {
-            setServiceStatus('done');
-            setIslResponse(['success']);
+        
+        if (signal === 'SHOW_PLACEHOLDER_IMAGES') {
+            const finalItems = items.length > 0 ? items : options;
+            setPlaceholderImages(finalItems);
             setFoodOptions([]);
             setShowWaiterButton(false);
+            setWaiterActive(true);
+            setAgentSpeaking(false);
+        }
+        
+        if (signal === 'SHOW_FOODS' || signal === 'SHOW_MENU_IMAGES') {
+            const finalOptions = items.length > 0 ? items : options;
+            setFoodOptions(finalOptions);
+            setPlaceholderImages([]);
+            setShowWaiterButton(false);
+            setWaiterActive(true);
+        }
+        
+        if (signal === 'ORDER_DONE' || signal === 'WORK_DONE' || data.status === 'done') {
+            setServiceStatus('done');
+            setIslResponse(['order_done']); // Trigger order_done.glb animation
+            setFoodOptions([]);
+            setPlaceholderImages([]);
+            setShowWaiterButton(false);
             setWaiterActive(false);
+            setAgentSpeaking(false);
         }
 
-        // Play TTS: Use Provider Reply in their detected language
-        if (voiceAudio) {
+        // Agent speaking state (pause mic visually)
+        if (providerReply && providerReply.trim() && providerReply !== '[NONE]' && signal !== 'ORDER_DONE') {
+            setAgentSpeaking(true);
+            
+            // Add agent's question to provider in chat (only if different from user summary)
+            if (providerReply !== userSummary) {
+                setHistory(prev => [...prev, {
+                    role: 'agent',
+                    text: `🗣️ Agent to Provider: ${providerReply}`,
+                    timestamp: new Date(),
+                    lang: waiterLang,
+                }]);
+            }
+            // agentSpeaking is cleared in playBase64Audio().onended / utterance.onend below
+        }
+
+        // Play TTS: Use Provider Reply in their detected language (only if not empty/none)
+        console.log('[App.handleServerPayload] TTS decision:');
+        console.log('  - Has voiceAudio?', !!voiceAudio);
+        console.log('  - providerReply valid?', providerReply && providerReply !== '[NONE]');
+        if (voiceAudio && providerReply && providerReply !== '[NONE]') {
+            console.log('[TTS] ✓ Playing Google TTS audio from server');
             playBase64Audio(voiceAudio);
-        } else if (providerReply) {
-            // Fallback: Browser-based TTS
+        } else if (providerReply && providerReply.trim() && providerReply !== '[NONE]') {
+            console.log('[TTS] ✓ Using browser TTS fallback for:', providerReply.substring(0, 50));
             const clean = providerReply.replace('WORK_DONE', '').trim();
             const utterance = new SpeechSynthesisUtterance(clean);
-            // Try to match the language
-            utterance.lang = waiterLang === 'hi' ? 'hi-IN' : waiterLang === 'kn' ? 'kn-IN' : waiterLang === 'ta' ? 'ta-IN' : 'en-IN';
+            // Try to match the language with female voice preference
+            const langMap: Record<string, string> = {
+                'hi': 'hi-IN',
+                'en': 'en-US',
+                'kn': 'kn-IN',
+                'ta': 'ta-IN'
+            };
+            utterance.lang = langMap[waiterLang] || 'en-US';
 
             const voices = window.speechSynthesis.getVoices();
             const femaleVoice = voices.find(v =>
                 v.lang.startsWith(utterance.lang.split('-')[0]) &&
-                (v.name.toLowerCase().includes('female') || v.name.toLowerCase().includes('google'))
+                (v.name.toLowerCase().includes('female') || 
+                 v.name.toLowerCase().includes('google') ||
+                 v.name.toLowerCase().includes('samantha') ||
+                 v.name.toLowerCase().includes('zira'))
             );
-            if (femaleVoice) utterance.voice = femaleVoice;
+            if (femaleVoice) {
+                console.log('[TTS] Using female voice:', femaleVoice.name);
+                utterance.voice = femaleVoice;
+            } else {
+                console.log('[TTS] No female voice found, using default');
+            }
+            utterance.pitch = 1.1; // Slightly higher pitch for female voice
+            utterance.onend = () => {
+                console.log('[TTS] Browser TTS finished — resuming mic');
+                setAgentSpeaking(false);
+            };
+            utterance.onerror = () => setAgentSpeaking(false);
             window.speechSynthesis.speak(utterance);
         }
     }, [lang]);
 
     const playBase64Audio = (b64: string) => {
         try {
+            console.log('[Audio] Decoding base64 audio, length:', b64.length);
             const binary = atob(b64);
             const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -122,10 +261,24 @@ const App: React.FC = () => {
             const url = URL.createObjectURL(blob);
             if (audioRef.current) {
                 audioRef.current.src = url;
-                audioRef.current.play().catch(console.error);
+                audioRef.current.onended = () => {
+                    console.log('[Audio] TTS finished — resuming mic');
+                    setAgentSpeaking(false);
+                    URL.revokeObjectURL(url);
+                };
+                audioRef.current.play().then(() => {
+                    console.log('[Audio] Playing TTS audio successfully');
+                }).catch(err => {
+                    console.error('[Audio] Play failed:', err);
+                    setAgentSpeaking(false); // unblock mic on error
+                });
+            } else {
+                console.error('[Audio] audioRef is null');
+                setAgentSpeaking(false);
             }
         } catch (e) {
             console.error('[Audio] Failed to play TTS audio', e);
+            setAgentSpeaking(false);
         }
     };
 
@@ -153,9 +306,12 @@ const App: React.FC = () => {
 
             handleServerPayload(data);
 
-            // Mission 3.0: Force button if food_order intent detected
+            // Force button if food_order intent detected (Stage 1)
             if (data.intent === 'food_order' || data.intent === 'hungry') {
-                setShowWaiterButton(true);
+                console.log('[Upload] Food order intent detected, ensuring button shows');
+                if (data.signal === 'SHOW_WAITER_BUTTON' || data.signal === 'SHOW_PROVIDER_BUTTON') {
+                    setShowWaiterButton(true);
+                }
             }
 
             if (data.status !== 'done') {
@@ -174,17 +330,33 @@ const App: React.FC = () => {
 
     // ---------- Send WS message ----------
     const sendWsMessage = useCallback((text: string, type = 'text', action?: string, item?: string) => {
+        const payload = { text, type, action, item, lang, session_id: sessionId };
+        console.log('[App.sendWsMessage] ========================================');
+        console.log('[App.sendWsMessage] ▶ Sending message');
+        console.log('[App.sendWsMessage] WS state:', ws?.readyState, '(1=OPEN, 0=CONNECTING, 2=CLOSING, 3=CLOSED)');
+        console.log('[App.sendWsMessage] Payload:', JSON.stringify(payload));
+        console.log('[App.sendWsMessage] Timestamp:', new Date().toISOString());
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ text, type, action, item, lang, session_id: sessionId }));
+            try {
+                ws.send(JSON.stringify(payload));
+                console.log('[App.sendWsMessage] ✓✓✓ Sent successfully ✓✓✓');
+            } catch (sendError) {
+                console.error('[App.sendWsMessage] ✗ Send failed:', sendError);
+            }
+        } else {
+            console.error('[App.sendWsMessage] ✗✗✗ WebSocket not open! State:', ws?.readyState);
+            console.error('[App.sendWsMessage] Cannot send message - connection issue!');
         }
+        console.log('[App.sendWsMessage] ========================================');
     }, [ws, lang, sessionId]);
 
     // ---------- Actions ----------
     const handleSpeakToWaiter = () => {
         setShowWaiterButton(false);
+        setWaiterActive(true); // Immediately activate to show mic
         setHistory(prev => [...prev, {
             role: 'user',
-            text: '👆 Interaction: Speak to Waiter',
+            text: '👆 Interaction: Speak to Provider',
             timestamp: new Date(),
         }]);
         sendWsMessage('', 'action', 'speak_to_waiter');
@@ -192,23 +364,39 @@ const App: React.FC = () => {
 
     // ---------- Voice controls (provider interface) ----------
     const handleVoiceMessage = useCallback((text: string) => {
+        console.log('[App.handleVoiceMessage] ========================================');
+        console.log('[App.handleVoiceMessage] Provider said:', text);
         setHistory(prev => [...prev, {
             role: 'provider',
             text,
             timestamp: new Date(),
         }]);
+        console.log('[App.handleVoiceMessage] Sending via WebSocket...');
         sendWsMessage(text);
+        console.log('[App.handleVoiceMessage] ========================================');
     }, [sendWsMessage]);
 
     // ---------- Food selection ----------
     const handleFoodSelect = useCallback((food: string) => {
         setFoodOptions([]);
+        setPlaceholderImages([]);
         setHistory(prev => [...prev, {
             role: 'user',
             text: `🍽️ Selected: ${food}`,
             timestamp: new Date(),
         }]);
-        sendWsMessage(`Selected: ${food}`, 'selection', 'user_selection', food);
+        sendWsMessage('', 'selection', 'user_selection', food);
+    }, [sendWsMessage]);
+
+    // ---------- Placeholder image selection ----------
+    const handleImageSelect = useCallback((item: string) => {
+        setPlaceholderImages([]);
+        setHistory(prev => [...prev, {
+            role: 'user',
+            text: `🍽️ Selected: ${item}`,
+            timestamp: new Date(),
+        }]);
+        sendWsMessage('', 'selection', 'user_selection', item);
     }, [sendWsMessage]);
 
     const handleReset = () => {
@@ -216,7 +404,9 @@ const App: React.FC = () => {
         setIslResponse([]);
         setHistory([]);
         setFoodOptions([]);
+        setPlaceholderImages([]);
         setShowWaiterButton(false);
+        setAgentSpeaking(false);
     };
 
     const formatTime = (d: Date) =>
@@ -267,23 +457,53 @@ const App: React.FC = () => {
                             <div className="pulse-mic">
                                 <Mic size={24} color="#7c3aed" />
                             </div>
-                            <span>Waiter Mode Active</span>
+                            <span>{agentSpeaking ? 'Agent speaking...' : 'Provider Mode Active'}</span>
                         </div>
                     )}
 
-                    {/* Mission 3.0: Fixed floating pulsing mic feedback */}
-                    {waiterActive && (
-                        <div className="fixed-mic-overlay">
+                    {/* Mission: Fixed floating mic feedback with speaking state */}
+                    {waiterActive && !agentSpeaking && (
+                        <div className="fixed-mic-overlay pulsing">
                             <Mic className="mic-icon-pulse" size={24} />
-                            <span>Listening to Waiter...</span>
+                            <span>Listening to Provider...</span>
+                        </div>
+                    )}
+
+                    {waiterActive && agentSpeaking && (
+                        <div className="fixed-mic-overlay paused">
+                            <Mic className="mic-icon-paused" size={24} />
+                            <span>Agent speaking...</span>
                         </div>
                     )}
 
                     {showWaiterButton && (
                         <div className="mediator-action">
                             <button className="btn-waiter" onClick={handleSpeakToWaiter}>
-                                🤝 Speak to Waiter
+                                🎤 Speak to Provider
                             </button>
+                        </div>
+                    )}
+
+                    {/* Placeholder image grid - shown when SHOW_PLACEHOLDER_IMAGES signal received */}
+                    {placeholderImages.length > 0 && (
+                        <div className="placeholder-grid-wrap">
+                            <div className="placeholder-title">📋 Available Items (Select One)</div>
+                            <div className="placeholder-grid">
+                                {placeholderImages.map((item, idx) => (
+                                    <div
+                                        key={idx}
+                                        className="placeholder-card"
+                                        onClick={() => handleImageSelect(item)}
+                                    >
+                                        <img
+                                            src={`https://via.placeholder.com/200x150/7c3aed/ffffff?text=${encodeURIComponent(item)}`}
+                                            alt={item}
+                                            className="placeholder-img"
+                                        />
+                                        <div className="placeholder-label">{item}</div>
+                                    </div>
+                                ))}
+                            </div>
                         </div>
                     )}
 
@@ -338,6 +558,8 @@ const App: React.FC = () => {
                             onSendMessage={handleVoiceMessage}
                             lang={lang}
                             waiterActive={waiterActive}
+                            agentSpeaking={agentSpeaking}
+                            waiterLang={waiterLang}
                         />
                     )}
                 </section>
@@ -497,7 +719,6 @@ const App: React.FC = () => {
           position: fixed;
           bottom: 40px;
           right: 40px;
-          background: #ef4444;
           color: white;
           padding: 12px 24px;
           border-radius: 9999px;
@@ -505,10 +726,21 @@ const App: React.FC = () => {
           align-items: center;
           gap: 12px;
           font-weight: 700;
-          box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4);
           z-index: 1000;
+          transition: all 0.3s ease;
+        }
+        
+        .fixed-mic-overlay.pulsing {
+          background: #ef4444;
+          box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4);
           animation: overlay-pulse 2s infinite;
         }
+        
+        .fixed-mic-overlay.paused {
+          background: #64748b;
+          box-shadow: 0 10px 25px rgba(100, 116, 139, 0.4);
+        }
+        
         @keyframes overlay-pulse {
           0% { transform: scale(1); opacity: 1; }
           50% { transform: scale(1.05); opacity: 0.9; }
@@ -517,9 +749,68 @@ const App: React.FC = () => {
         .mic-icon-pulse {
           animation: mic-bounce 1s infinite alternate;
         }
+        .mic-icon-paused {
+          opacity: 0.6;
+        }
         @keyframes mic-bounce {
           from { transform: translateY(0); }
           to { transform: translateY(-2px); }
+        }
+        
+        /* Placeholder Image Grid */
+        .placeholder-grid-wrap {
+          background: #1a1a2e;
+          border: 1px solid rgba(255,255,255,0.07);
+          border-radius: 16px;
+          padding: 20px;
+          animation: fadeIn 0.3s ease;
+        }
+        
+        .placeholder-title {
+          font-size: 0.9rem;
+          font-weight: 700;
+          color: #7c3aed;
+          margin-bottom: 16px;
+          text-align: center;
+          letter-spacing: 0.3px;
+        }
+        
+        .placeholder-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+          gap: 16px;
+        }
+        
+        .placeholder-card {
+          background: rgba(124,58,237,0.08);
+          border: 2px solid rgba(124,58,237,0.2);
+          border-radius: 12px;
+          overflow: hidden;
+          cursor: pointer;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .placeholder-card:hover {
+          transform: translateY(-4px);
+          border-color: #7c3aed;
+          box-shadow: 0 8px 20px rgba(124,58,237,0.3);
+        }
+        
+        .placeholder-img {
+          width: 100%;
+          height: 120px;
+          object-fit: cover;
+          display: block;
+        }
+        
+        .placeholder-label {
+          padding: 10px 12px;
+          text-align: center;
+          font-size: 0.85rem;
+          font-weight: 600;
+          color: #ddd;
+          text-transform: capitalize;
+          background: rgba(0,0,0,0.3);
         }
       `}</style>
         </div>

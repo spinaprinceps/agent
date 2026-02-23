@@ -3,19 +3,42 @@ import { Canvas } from '@react-three/fiber';
 import { OrbitControls, useGLTF, useAnimations } from '@react-three/drei';
 
 const ClipPlayer = ({ clipName }: { clipName: string }) => {
-    // In a real app, this would dynamically load models/clipName.gltf
-    // For MVP, we'll try to load or show a placeholder if clip not found.
-    const modelUrl = `/models/${clipName}.gltf`;
+    // Dynamically load models from /models folder
+    // Supports both .gltf and .glb files
+    const modelUrl = `/models/${clipName}.glb`; // Try .glb first
+    const fallbackUrl = `/models/${clipName}.gltf`; // Fallback to .gltf
 
-    // Custom hook to try load, with fallback logic
-    const { scene, animations } = useGLTF(modelUrl);
+    let scene, animations;
+    try {
+        const result = useGLTF(modelUrl);
+        scene = result.scene;
+        animations = result.animations;
+    } catch (e) {
+        // Fallback to .gltf if .glb not found
+        try {
+            const result = useGLTF(fallbackUrl);
+            scene = result.scene;
+            animations = result.animations;
+        } catch (err) {
+            console.warn(`Model not found for clip: ${clipName}`);
+            return <PlaceholderAvatar />;
+        }
+    }
+
     const { actions, names } = useAnimations(animations, scene);
 
     useEffect(() => {
         if (names.length > 0) {
-            actions[names[0]]?.reset().fadeIn(0.5).play();
+            // Play the first animation in the model
+            const action = actions[names[0]];
+            action?.reset().fadeIn(0.5).play();
+            
+            // Special handling for order_done - loop the animation
+            if (clipName === 'order_done') {
+                action?.setLoop(2200, Infinity); // Loop indefinitely
+            }
         }
-    }, [names, actions]);
+    }, [names, actions, clipName]);
 
     return <primitive object={scene} scale={2} position={[0, -2, 0]} />;
 };
@@ -44,11 +67,17 @@ const ISLAvatar: React.FC<ISLAvatarProps> = ({ responseSequence }) => {
 
     useEffect(() => {
         if (currentClipIndex >= 0 && currentClipIndex < responseSequence.length) {
+            // Special handling for order_done - keep it playing longer
+            const isOrderDone = responseSequence[currentClipIndex] === 'order_done';
+            const duration = isOrderDone ? 10000 : 3000; // 10 seconds for order_done, 3 for others
+            
             const timer = setTimeout(() => {
-                setCurrentClipIndex(prev => prev + 1);
-            }, 3000); // 3 seconds per sign clip
+                if (!isOrderDone) {
+                    setCurrentClipIndex(prev => prev + 1);
+                }
+            }, duration);
             return () => clearTimeout(timer);
-        } else {
+        } else if (currentClipIndex >= responseSequence.length) {
             setCurrentClipIndex(-1);
         }
     }, [currentClipIndex, responseSequence]);

@@ -1,24 +1,31 @@
+"""
+CLEAN 3-ENTITY AGENTIC ORCHESTRATION SERVICE AGENT
+Strict mediator between USER (deaf person) and PROVIDER (waiter).
+NEVER role-plays. NEVER invents content. Temperature = 0.95 ALWAYS.
+"""
+
 import os
 import json
 import re
-from typing import Annotated, Any, Dict, List, Optional
-
+import asyncio
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+from langdetect import detect, DetectorFactory
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
-from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Force consistent language detection
+DetectorFactory.seed = 0
 
 # ---------------------------------------------------------------------------
 # State
@@ -35,246 +42,372 @@ class AgentState(TypedDict):
     food_options: List[str]
     waiter_lang: str
     waiter_mode_active: bool
+    last_provider_message: str
+    selected_item: str
+    # Parsed output fields (extracted by process_response node)
+    provider_reply: str
+    user_summary: str
+    signal: str
 
 
 # ---------------------------------------------------------------------------
-# Waiter LLM (separate invocation, no tools, waiter persona)
-# ---------------------------------------------------------------------------
-
-_waiter_llm = ChatVertexAI(
-    model_name="gemini-2.0-flash-001",
-    project=os.getenv("GOOGLE_PROJECT_ID"),
-    location="us-central1",
-    temperature=0.95,  # Strict temperature
-    top_p=0.95,
-)
-
-
-def _call_waiter_llm(query: str, lang: str = "en") -> str:
-    """Internal: invoke the waiter persona LLM and return its response."""
-    system = (
-        f"You are a friendly Indian restaurant waiter. Respond in {lang}. "
-        "Keep your reply brief (1-2 sentences). "
-        "NEVER list food items from your memory. Respond ONLY based on what is natural to say in a restaurant context. "
-        "Every time you are asked, provide a completely fresh and unique response. "
-        "Be warm and natural. If an order is confirmed or payment mentioned, say 'I have confirmed your order' or 'Payment received'."
-    )
-    msgs = [SystemMessage(content=system), HumanMessage(content=query)]
-    response = _waiter_llm.invoke(msgs)
-    return response.content
-
-
-def _detect_language(text: str) -> str:
-    """Detect the language of the waiter's text. Returns code: hi, en, ta, kn."""
-    prompt = (
-        "Identify the language of the following text. "
-        "Return ONLY the language code: 'hi' for Hindi, 'en' for English, 'kn' for Kannada, 'ta' for Tamil. "
-        "If you are unsure, default to 'en'.\n\n"
-        f"Text: {text}"
-    )
-    # Using the same waiter LLM for detection as it's a simple task
-    response = _waiter_llm.invoke([HumanMessage(content=prompt)])
-    code = response.content.strip().lower()
-    # Basic validation
-    if code in ["hi", "en", "kn", "ta"]:
-        return code
-    return "en"
-
-
-def _extract_food_items(waiter_reply: str) -> List[str]:
-    """Pull known food keywords from the waiter reply."""
-    known = [
-        "pizza", "burger", "pasta", "biryani", "dosa", "sandwich",
-        "noodles", "rice", "roti", "idli", "vada", "thali", "salad",
-        "soup", "curry", "kebab", "wrap", "paratha", "paneer", "chicken",
-    ]
-    reply_lower = waiter_reply.lower()
-    found = [item for item in known if item in reply_lower]
-    if not found:
-        # Fallback extraction: grab comma-separated capitalised words
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', waiter_reply)
-        found = [w.lower() for w in words if w.lower() not in
-                 {"the", "and", "our", "for", "are", "you", "have", "with",
-                  "that", "this", "from", "your", "also", "very", "some",
-                  "today", "available", "would", "like", "what", "can"}][:6]
-    return list(dict.fromkeys(found))[:6]  # deduplicate, max 6
-
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-@tool
-def ask_user(question: str) -> str:
-    """Ask the user a clarifying question to gather missing information."""
-    return f"ASK_USER: {question}"
-
-
-@tool
-def update_order(key: str, value: str) -> str:
-    """Update a specific field in the ongoing order/booking details.
-    e.g. key='food_type', value='pizza' or key='quantity', value='2'."""
-    return f"ORDER_UPDATED: {key}={value}"
-
-
-@tool
-def query_waiter(message: str, current_waiter_lang: str = "en") -> str:
-    """Simulate a conversation with a restaurant waiter.
-    Use this to talk to the waiter persona. The waiter responds naturally
-    in the requested language. Use the returned information to update the user."""
-    print(f"[DEBUG] Tool: query_waiter called with: {message} ({current_waiter_lang})")
-    waiter_reply = _call_waiter_llm(message, current_waiter_lang)
-    food_items = _extract_food_items(waiter_reply)
-    detected_lang = _detect_language(waiter_reply)
-    result = {
-        "waiter_says": waiter_reply,
-        "food_options": food_items,
-        "detected_lang": detected_lang,
-    }
-    dump = json.dumps(result)
-    print(f"[DEBUG] Tool: query_waiter result: {dump}")
-    return f"WAITER_REPLY: {dump}"
-
-
-@tool
-def complete_service() -> str:
-    """Finalize the service request. Call this when the waiter has confirmed
-    and the user is satisfied. This signals the frontend success animation."""
-    return "WORK_DONE: Service request completed successfully!"
-
-
-tools = [ask_user, update_order, query_waiter, complete_service]
-tool_node = ToolNode(tools)
-
-# ---------------------------------------------------------------------------
-# LLM
+# LLM Configuration
 # ---------------------------------------------------------------------------
 
 llm = ChatVertexAI(
     model_name="gemini-2.0-flash-001",
     project=os.getenv("GOOGLE_PROJECT_ID"),
     location="us-central1",
-    temperature=0.95,  # Strict temperature
+    temperature=0.95,  # UNBREAKABLE: Always 0.95
     top_p=0.95,
-).bind_tools(tools)
+    timeout=20,  # 20 second timeout for LLM calls
+)
+
+food_parser_llm = ChatVertexAI(
+    model_name="gemini-2.0-flash-001",
+    project=os.getenv("GOOGLE_PROJECT_ID"),
+    location="us-central1",
+    temperature=0.95,  # UNBREAKABLE: Always 0.95
+    top_p=0.95,
+    timeout=15,  # 15 second timeout for food parsing
+)
 
 
 # ---------------------------------------------------------------------------
-# Graph nodes
+# Language Detection
+# ---------------------------------------------------------------------------
+
+def detect_language(text: str) -> str:
+    """
+    Detect provider language using langdetect.
+    Returns: 'hi', 'en', 'ta', 'kn', or defaults to 'en'
+    """
+    if not text or len(text.strip()) < 3:
+        return "en"
+    
+    try:
+        detected = detect(text)
+        # Map to supported languages
+        lang_map = {
+            "hi": "hi",  # Hindi
+            "en": "en",  # English
+            "ta": "ta",  # Tamil
+            "kn": "kn",  # Kannada
+            "te": "hi",  # Telugu -> fallback to Hindi (similar script)
+            "mr": "hi",  # Marathi -> fallback to Hindi (similar script)
+        }
+        return lang_map.get(detected, "en")
+    except Exception as e:
+        print(f"[LANG_DETECT] Error: {e}, defaulting to 'en'")
+        return "en"
+
+
+# ---------------------------------------------------------------------------
+# Food Item Parser
+# ---------------------------------------------------------------------------
+
+async def parse_food_items(text: str, detected_lang: str) -> List[str]:
+    """
+    Extract ONLY the food item names mentioned in the provider's message.
+    Uses keyword matching first (fast), then Gemini as fallback.
+    """
+    if not text:
+        return []
+
+    # Fast keyword match (handles transliterated / common foods)
+    # Keys are search terms, values are canonical names
+    FOOD_KEYWORDS = {
+        "idli": "idli", "इडली": "idli",
+        "dosa": "dosa", "डोसा": "dosa",
+        "vada": "vada", "वड़ा": "vada", "wada": "vada",
+        "samosa": "samosa", "समोसा": "samosa",
+        "biryani": "biryani", "बिरयानी": "biryani",
+        "rice": "rice", "चावल": "rice",
+        "roti": "roti", "रोटी": "roti", "chapati": "roti",
+        "dal": "dal", "दाल": "dal",
+        "coffee": "coffee", "कॉफी": "coffee",
+        "tea": "tea", "टी": "tea", "chai": "chai", "चाय": "chai",
+        "juice": "juice", "जूस": "juice",
+        "pizza": "pizza", "burger": "burger", "sandwich": "sandwich",
+        "poha": "poha", "पोहा": "poha",
+        "upma": "upma", "उपमा": "upma",
+        "puri": "puri", "पूरी": "puri",
+    }
+
+    lower = text.lower()
+    found = []
+    for kw, canonical in FOOD_KEYWORDS.items():
+        if kw.lower() in lower and canonical not in found:
+            found.append(canonical)
+
+    if found:
+        print(f"[FOOD_PARSE] Keyword match found: {found}")
+        return found[:6]
+
+    # Fallback: LLM extraction (run in thread pool to avoid blocking)
+    prompt = f"""Extract ONLY the food/drink item names from this text.
+Return as a JSON list of strings. No explanations, just the item names.
+If no items found, return empty list [].
+
+Text: {text}
+
+Example output: ["idli", "tea", "coffee"]
+"""
+    try:
+        response = await asyncio.to_thread(
+            food_parser_llm.invoke,
+            [HumanMessage(content=prompt)]
+        )
+        content = response.content.strip()
+        match = re.search(r'\[.*?\]', content, re.DOTALL)
+        if match:
+            items = json.loads(match.group(0))
+            normalized = []
+            for item in items:
+                if isinstance(item, str) and item.strip():
+                    normalized.append(item.strip().lower())
+            print(f"[FOOD_PARSE] LLM found: {normalized}")
+            return list(dict.fromkeys(normalized))[:6]
+        return []
+    except Exception as e:
+        print(f"[FOOD_PARSE] Error: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Translation Helper
+# ---------------------------------------------------------------------------
+
+def translate_text(text: str, target_lang: str) -> str:
+    """
+    Translate text to target language using Gemini.
+    Temperature = 0.95 (strict).
+    """
+    if target_lang == "en":
+        return text
+    
+    lang_names = {
+        "hi": "Hindi",
+        "ta": "Tamil",
+        "kn": "Kannada",
+        "en": "English"
+    }
+    
+    target_name = lang_names.get(target_lang, "Hindi")
+    
+    prompt = f"""Translate the following text to {target_name}.
+Return ONLY the translation, no explanations.
+
+Text: {text}
+
+Translation:"""
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return response.content.strip()
+    except Exception as e:
+        print(f"[TRANSLATION] Error: {e}")
+        return text
+
+
+# ---------------------------------------------------------------------------
+# System Prompt Builder
 # ---------------------------------------------------------------------------
 
 def build_system_prompt(state: AgentState) -> str:
-    waiter_mode = state.get("waiter_mode_active", False)
-    return (
-        "You are the AGENT (Mediator AI). You facilitate interaction between a PROVIDER (Waiter) and a USER (Deaf Person).\n\n"
-        "STRICT UNBREAKABLE RULES:\n"
-        "1. DYNAMIC LANGUAGE: You MUST respond to the PROVIDER in exactly the same language they used (Current: {waiter_lang}).\n"
-        "2. DUAL RESPONSE FORMAT: You MUST provide your response in EXACTLY this schema every time:\n"
-        "   PROVIDER_REPLY: [Your direct reply back to the waiter in {waiter_lang}]\n"
-        "   DEAF_SUMMARY: [Simple English summary of the waiter's info for the deaf user]\n\n"
-        "3. NO HALLUCINATION: You can ONLY summarize or repeat what the PROVIDER just said. NEVER add or remember items from your own knowledge.\n"
-        "4. 3-ENTITY FLOW:\n"
-        "   - If PROVIDER lists foods (e.g., 'idli, tea'), DEAF_SUMMARY must include [[SHOW_PLACEHOLDER_IMAGES: idli, tea]].\n"
-        "   - If USER selects an item (e.g., 'idli'), PROVIDER_REPLY must ask the waiter: 'The customer wants to order [item]. What is the price? How long will it take?' (In {waiter_lang}).\n"
-        "5. FIRST TURN: If no waiter speech yet, PROVIDER_REPLY must be: 'What food items do you have available?' (Translated to {waiter_lang}).\n\n"
-        "THINK STEP-BY-STEP EVERY TIME:\n"
-        "Step 1: What is the latest input (Speech or Selection)?\n"
-        "Step 2: What is the detected language ({waiter_lang})?\n"
-        "Step 3: Generate PROVIDER_REPLY in {waiter_lang} and DEAF_SUMMARY + signals in English.\n"
-        "Step 4: Do NOT invent anything.\n\n"
-        "CONTEXT:\n"
-        "- Waiter Language: {waiter_lang}\n"
-        "- Order Details: {details}"
-    ).format(
-        waiter_lang=state.get("waiter_lang", "en"),
-        details=json.dumps(state.get("order_details", {})),
-    )
-
-
-def call_model(state: AgentState) -> dict:
-    messages = state["messages"]
-    system_prompt = build_system_prompt(state)
-    print(f"[DEBUG] [AGENT] Constructing prompt. Waiter Mode: {state.get('waiter_mode_active')}")
-    full_messages: List[BaseMessage] = [SystemMessage(content=system_prompt)] + list(messages)
-    response = llm.invoke(full_messages)
-    return {"messages": [response]}
-
-
-def should_continue(state: AgentState) -> str:
-    last = state["messages"][-1]
-    if hasattr(last, "tool_calls") and last.tool_calls:
-        return "tools"
-    return END
-
-
-def process_tool_results(state: AgentState) -> dict:
-    messages = state["messages"]
-    order_details = dict(state.get("order_details", {}))
-    is_done = state.get("is_done", False)
-    food_options = list(state.get("food_options", []))
+    """
+    Build the UNBREAKABLE system prompt for the mediator agent.
+    """
     waiter_lang = state.get("waiter_lang", "en")
-
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            content = msg.content or ""
-            if content.startswith("ORDER_UPDATED:"):
-                try:
-                    kv = content.replace("ORDER_UPDATED:", "").strip()
-                    k, v = kv.split("=", 1)
-                    order_details[k.strip()] = v.strip()
-                except ValueError:
-                    pass
-            if content.startswith("WAITER_REPLY:"):
-                try:
-                    raw = content.replace("WAITER_REPLY:", "").strip()
-                    parsed = json.loads(raw)
-                    food_options = parsed.get("food_options", food_options)
-                    waiter_lang = parsed.get("detected_lang", waiter_lang)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            if "WORK_DONE" in content:
-                is_done = True
-
-    return {
-        "order_details": order_details,
-        "is_done": is_done,
-        "food_options": food_options,
-        "waiter_lang": waiter_lang,
+    food_options = state.get("food_options", [])
+    selected_item = state.get("selected_item", "")
+    last_provider_msg = state.get("last_provider_message", "")
+    
+    lang_names = {
+        "hi": "Hindi",
+        "en": "English",
+        "ta": "Tamil",
+        "kn": "Kannada"
     }
+    
+    provider_lang_name = lang_names.get(waiter_lang, "English")
+    
+    return f"""YOU ARE THE AGENT (MEDIATOR AI) - UNBREAKABLE RULES
+
+=== 3-ENTITY ARCHITECTURE (STRICT) ===
+1. USER (deaf person): Communicates via ISL video/signs → receives English summaries
+2. PROVIDER (waiter): Speaks in ANY language → you detect and adapt every turn
+3. AGENT (you): NEVER role-play as provider. ONLY mediate between user and provider.
+
+=== YOUR RESPONSIBILITIES ===
+- Relay provider's words to user in simple English
+- Ask provider questions in provider's current language ({provider_lang_name})
+- Detect provider language EVERY message and adapt instantly
+- Extract food items when provider lists them
+- Handle user selections and ask provider for details
+
+=== CURRENT CONTEXT ===
+Provider Language: {waiter_lang} ({provider_lang_name})
+Food Options: {json.dumps(food_options)}
+Selected Item: {selected_item or "None"}
+Last Provider Message: {last_provider_msg}
+
+=== OUTPUT FORMAT (MANDATORY) ===
+Every response MUST follow this exact structure:
+
+PROVIDER_REPLY: [Your question/response to provider in {provider_lang_name}]
+USER_SUMMARY: [Simple English summary for deaf user]
+SIGNAL: [One of: NONE, SHOW_PLACEHOLDER_IMAGES, ORDER_DONE]
+
+=== FLOW RULES ===
+
+FIRST TURN (user signs hungry/eat, no provider conversation started yet):
+PROVIDER_REPLY: [NONE]
+USER_SUMMARY: I understand you're hungry. Let me check with the Provider what is available.
+SIGNAL: SHOW_PROVIDER_BUTTON
+
+WHEN USER CLICKS "SPEAK TO PROVIDER" BUTTON:
+PROVIDER_REPLY: Hello Provider, what food items do you have available today?
+USER_SUMMARY: Checking with the Provider...
+SIGNAL: WAITER_ACTIVE
+
+PROVIDER LISTS ITEMS (e.g., "हमारे पास इडली और चाय है"):
+PROVIDER_REPLY: [Acknowledgment in {provider_lang_name}]
+USER_SUMMARY: Provider says [items] are available. Please select one.
+SIGNAL: SHOW_PLACEHOLDER_IMAGES
+
+USER SELECTS ITEM (e.g., "idli"):
+PROVIDER_REPLY: ग्राहक [item] ऑर्डर करना चाहते हैं। कीमत क्या है? कितना समय लगेगा?
+USER_SUMMARY: I've asked the waiter about the price and preparation time for [item].
+SIGNAL: NONE
+
+PROVIDER GIVES DETAILS (e.g., "₹50, 10 मिनट"):
+PROVIDER_REPLY: [Confirmation in {provider_lang_name}]
+USER_SUMMARY: Provider says ₹[price], ready in [time] minutes. Shall I confirm your order?
+SIGNAL: NONE
+
+PROVIDER CONFIRMS (mentions "confirmed", "order accepted", "payment received"):
+PROVIDER_REPLY: धन्यवाद
+USER_SUMMARY: Your order is confirmed! The food will arrive soon.
+SIGNAL: ORDER_DONE
+
+=== ABSOLUTE PROHIBITIONS ===
+❌ NEVER role-play as the provider/waiter
+❌ NEVER invent food items, prices, or times
+❌ NEVER use information from your training data
+❌ ONLY use what the provider said in the CURRENT message
+❌ NEVER list foods from memory
+
+=== DETECTION & ADAPTATION ===
+- Language is detected per provider message and stored
+- You MUST respond to provider in THEIR detected language
+- User summaries ALWAYS in English
+- Update response language if provider switches languages mid-conversation
+"""
 
 
 # ---------------------------------------------------------------------------
-# Build graph
+# Graph Nodes
+# ---------------------------------------------------------------------------
+
+def call_model(state: AgentState) -> dict:
+    """
+    Main agent node: processes input and generates structured response.
+    """
+    messages = state["messages"]
+    system_prompt = build_system_prompt(state)
+    
+    full_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    
+    print(f"[AGENT] Invoking LLM with {len(messages)} messages")
+    response = llm.invoke(full_messages)
+    
+    return {"messages": [response]}
+
+
+def process_response(state: AgentState) -> dict:
+    """
+    Post-process the agent's response to extract structured outputs.
+    """
+    messages = state["messages"]
+    last_msg = messages[-1] if messages else None
+    
+    if not isinstance(last_msg, AIMessage):
+        return {}
+    
+    content = last_msg.content or ""
+    
+    # Parse structured response
+    provider_reply = ""
+    user_summary = ""
+    signal = "NONE"
+    
+    # Extract PROVIDER_REPLY
+    provider_match = re.search(r'PROVIDER_REPLY:\s*(.+?)(?=USER_SUMMARY:|SIGNAL:|$)', content, re.DOTALL | re.IGNORECASE)
+    if provider_match:
+        provider_reply = provider_match.group(1).strip()
+    
+    # Extract USER_SUMMARY
+    summary_match = re.search(r'USER_SUMMARY:\s*(.+?)(?=SIGNAL:|$)', content, re.DOTALL | re.IGNORECASE)
+    if summary_match:
+        user_summary = summary_match.group(1).strip()
+    
+    # Extract SIGNAL
+    signal_match = re.search(r'SIGNAL:\s*([\w_]+)', content, re.IGNORECASE)
+    if signal_match:
+        signal = signal_match.group(1).strip().upper()
+    
+    # Detect completion signals in provider reply
+    completion_keywords = ["order accepted", "confirmed", "payment received", "order confirmed"]
+    last_provider = state.get("last_provider_message", "").lower()
+    if any(kw in last_provider for kw in completion_keywords):
+        signal = "ORDER_DONE"
+
+    # HARD OVERRIDE: first turn must ALWAYS show the provider button, never talk to provider
+    if not state.get("waiter_mode_active") and not state.get("last_provider_message"):
+        signal = "SHOW_PROVIDER_BUTTON"
+        provider_reply = "[NONE]"
+        if not user_summary or len(user_summary) < 5:
+            user_summary = "I understand you. Let me check with the Provider what is available."
+        print(f"[PROCESS_RESPONSE] First-turn override → SHOW_PROVIDER_BUTTON, provider_reply cleared")
+    
+    updates = {
+        "provider_reply": provider_reply,
+        "user_summary": user_summary,
+        "signal": signal,
+    }
+    
+    print(f"[PROCESS_RESPONSE] Signal: {signal}, Provider Reply: {provider_reply[:50]}..., User Summary: {user_summary[:50]}...")
+    
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# Build Graph
 # ---------------------------------------------------------------------------
 
 workflow = StateGraph(AgentState)
 
 workflow.add_node("agent", call_model)
-workflow.add_node("tools", tool_node)
-workflow.add_node("process_tool_results", process_tool_results)
+workflow.add_node("process", process_response)
 
 workflow.set_entry_point("agent")
-
-workflow.add_conditional_edges(
-    "agent",
-    should_continue,
-    {"tools": "tools", END: END},
-)
-workflow.add_edge("tools", "process_tool_results")
-workflow.add_edge("process_tool_results", "agent")
+workflow.add_edge("agent", "process")
+workflow.add_edge("process", END)
 
 memory = MemorySaver()
 compiled_graph = workflow.compile(checkpointer=memory)
 
 
 # ---------------------------------------------------------------------------
-# Session management
+# Session Management
 # ---------------------------------------------------------------------------
 
 _session_store: Dict[str, dict] = {}
 
 
 def get_or_create_agent(session_id: str, lang: str = "hi") -> "GraphAgent":
+    """Get or create a session agent."""
     if session_id not in _session_store:
         _session_store[session_id] = {
             "messages": [],
@@ -285,109 +418,208 @@ def get_or_create_agent(session_id: str, lang: str = "hi") -> "GraphAgent":
             "food_options": [],
             "waiter_lang": "en",
             "waiter_mode_active": False,
+            "last_provider_message": "",
+            "selected_item": "",
+            "provider_reply": "",
+            "user_summary": "",
+            "signal": "NONE",
         }
     return GraphAgent(session_id, lang)
 
 
 class GraphAgent:
+    """Agent wrapper for session-based interactions."""
+    
     def __init__(self, session_id: str, lang: str = "hi"):
         self.session_id = session_id
         self.lang = lang
         self.config = {"configurable": {"thread_id": session_id}}
-
+    
     async def get_response(
         self,
-        user_input: str,
-        detected_intent: str,
-        detected_details: Dict[str, Any],
+        user_input: str = "",
+        detected_intent: str = "",
+        detected_details: Dict[str, Any] = None,
         lang: str = "hi",
         session_id: str = "",
         action: str = None,
-        waiter_lang: str = "en"
-    ) -> tuple:
+        waiter_speech: str = "",
+        selected_item: str = "",
+    ) -> Tuple[str, str, List[str], str, str]:
+        """
+        Process input and return (bot_response, status, food_options, waiter_lang, signal).
+
+        DETERMINISTIC paths (no LLM) for reliability:
+          • user signs (first turn)         → SHOW_PROVIDER_BUTTON
+          • speak_to_waiter                 → WAITER_ACTIVE + greeting TTS
+          • user selects food item          → ask provider for price/time (LLM)
+          • provider speaks (waiter_speech) → full LLM mediation
+        """
         session_state = _session_store.get(self.session_id, {})
-        current_service = session_state.get("current_service", "food_order")
-        waiter_mode_active = session_state.get("waiter_mode_active", False)
+        waiter_lang = session_state.get("waiter_lang", "en")
+        food_options = session_state.get("food_options", [])
 
-        input_state: dict = {
-            "messages": [],
-            "lang": lang,
-        }
+        # ── CASE 1: User just signed (first turn) ────────────────────────────
+        if user_input and not session_state.get("waiter_mode_active"):
+            print(f"[AGENT] DETERMINISTIC first turn for sign: {user_input}")
+            user_summary  = "I understand you. Let me check with the Provider what is available."
+            provider_reply = "[NONE]"
+            signal         = "SHOW_PROVIDER_BUTTON"
+            bot_response   = f"PROVIDER_REPLY: {provider_reply}\nUSER_SUMMARY: {user_summary}"
+            return bot_response, "pending", food_options, waiter_lang, signal
 
+        # ── CASE 2: User clicked "Speak to Provider" ─────────────────────────
         if action == "speak_to_waiter":
-            waiter_mode_active = True
-            input_state["waiter_mode_active"] = True
-            input_state["waiter_lang"] = waiter_lang
-            input_state["messages"].append(HumanMessage(content=f"Action: [START_WAITER_CONVERSATION]. Detected Lang: {waiter_lang}. Respond according to rule 5."))
-            if self.session_id in _session_store:
-                _session_store[self.session_id]["waiter_mode_active"] = True
-                _session_store[self.session_id]["waiter_lang"] = waiter_lang
-        elif user_input:
-            # FIX Mission: Update language per turn
-            input_state["waiter_lang"] = waiter_lang
-            if self.session_id in _session_store:
-                _session_store[self.session_id]["waiter_lang"] = waiter_lang
-            input_state["messages"].append(HumanMessage(content=user_input))
+            print("[AGENT] DETERMINISTIC speak_to_waiter")
+            # Decide greeting language based on detected waiter_lang
+            lang_greetings = {
+                "hi": "नमस्ते! आज आपके पास कौन से खाने के आइटम उपलब्ध हैं?",
+                "en": "Hello! What food items do you have available today?",
+                "ta": "வணக்கம்! இன்று என்ன உணவு வகைகள் கிடைக்கின்றன?",
+                "kn": "ನಮಸ್ಕಾರ! ಇಂದು ಯಾವ ಆಹಾರ ಪದಾರ್ಥಗಳು ಲಭ್ಯವಿವೆ?",
+            }
+            provider_reply = lang_greetings.get(waiter_lang, lang_greetings["en"])
+            user_summary   = "Checking with the Provider about available food items..."
+            signal         = "WAITER_ACTIVE"
+            _session_store[self.session_id]["waiter_mode_active"] = True
+            bot_response   = f"PROVIDER_REPLY: {provider_reply}\nUSER_SUMMARY: {user_summary}"
+            print(f"[AGENT] Greeting provider in '{waiter_lang}': {provider_reply}")
+            return bot_response, "pending", food_options, waiter_lang, signal
 
-        print(f"[DEBUG] [AGENT] ainvoke start ({self.session_id}). Waiter Mode: {waiter_mode_active}")
-        result = await compiled_graph.ainvoke(input_state, self.config)
-        print(f"[DEBUG] [AGENT] ainvoke end ({self.session_id}). New messages: {len(result['messages'])}")
+        # ── CASE 3: Provider spoke — full LLM mediation ──────────────────────
+        if waiter_speech:
+            print("\n" + "#"*100)
+            print(f"[AGENT] 🎯 CASE 3: Provider spoke (waiter_speech={waiter_speech})")
+            print(f"#"*100)
+            print(f"[AGENT] → Step 1: Detect language")
+            detected_lang = detect_language(waiter_speech)
+            print(f"[AGENT] ✓ Language detected: {detected_lang}")
+            
+            print(f"[AGENT] → Step 2: Parse food items")
+            food_items = await parse_food_items(waiter_speech, detected_lang)
+            print(f"[AGENT] ✓ Food items parsed: {food_items}")
 
-        # Extract final AI response
-        final_response = ""
-        for msg in reversed(result["messages"]):
-            if isinstance(msg, AIMessage) and msg.content:
-                final_response = msg.content
-                break
+            # Persist detected language + message
+            _session_store[self.session_id]["waiter_lang"]           = detected_lang
+            _session_store[self.session_id]["last_provider_message"] = waiter_speech
+            if food_items:
+                _session_store[self.session_id]["food_options"] = food_items
+                food_options = food_items
+            waiter_lang = detected_lang
 
-        is_done = result.get("is_done", False)
-        food_options: List[str] = result.get("food_options", [])
-        waiter_lang: str = result.get("waiter_lang", "en")
+            # Build targeted LLM prompt (no format ambiguity)
+            lang_names = {"hi": "Hindi", "en": "English", "ta": "Tamil", "kn": "Kannada"}
+            lang_name  = lang_names.get(detected_lang, "the detected language")
 
-        # Check tool messages
-        for msg in result["messages"]:
-            if isinstance(msg, ToolMessage):
-                c = msg.content or ""
-                if "WORK_DONE" in c:
-                    is_done = True
-                if c.startswith("WAITER_REPLY:"):
-                    try:
-                        parsed = json.loads(c.replace("WAITER_REPLY:", "").strip())
-                        food_options = parsed.get("food_options", food_options)
-                        waiter_lang = parsed.get("detected_lang", waiter_lang)
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+            selected = session_state.get("selected_item", "")
+            context  = f"Selected item: {selected}" if selected else "No item selected yet."
 
-        show_match = re.search(r'SHOW_FOODS:\s*(\[.*?\])', final_response)
-        if show_match:
+            system = f"""You are an AI mediator between a deaf USER and a PROVIDER (waiter).
+The provider just spoke in {lang_name}. Relay the information to the user in simple English
+and reply to the provider in {lang_name}.
+
+CONTEXT: {context}
+FOOD ITEMS DETECTED: {json.dumps(food_items)}
+
+Reply in EXACTLY this format (no extra text):
+PROVIDER_REPLY: <your reply to provider in {lang_name}>
+USER_SUMMARY: <simple English summary for the deaf user>
+SIGNAL: <one of: NONE, SHOW_PLACEHOLDER_IMAGES, ORDER_DONE>
+
+Rules:
+- If provider listed food items, set SIGNAL to SHOW_PLACEHOLDER_IMAGES
+- If provider confirmed order/payment, set SIGNAL to ORDER_DONE
+- Otherwise SIGNAL is NONE
+- NEVER invent info not in the provider's message
+"""
+            human = f"Provider said: {waiter_speech}"
+            print(f"[AGENT] → Step 3: Call LLM (START)")
+            print(f"[AGENT] Using asyncio.to_thread to avoid blocking...")
             try:
-                food_options = json.loads(show_match.group(1))
-            except json.JSONDecodeError:
-                pass
-            final_response = re.sub(r'SHOW_FOODS:\s*\[.*?\]', '', final_response).strip()
+                import time
+                llm_start = time.time()
+                # Run synchronous LLM call in thread pool to avoid blocking event loop
+                print(f"[AGENT] ⏱️  Invoking LLM...")
+                response = await asyncio.to_thread(
+                    llm.invoke,
+                    [SystemMessage(content=system), HumanMessage(content=human)]
+                )
+                llm_elapsed = time.time() - llm_start
+                content = response.content.strip()
+                print(f"[AGENT] ✓✓✓ LLM responded in {llm_elapsed:.2f}s ✓✓✓")
+                print(f"[AGENT] LLM raw output ({len(content)} chars):\n{content}\n")
 
-        # Signal for Speak to Waiter button via tag
-        signal = None
-        if "[[SHOW_WAITER_BUTTON]]" in final_response:
-            signal = "SHOW_WAITER_BUTTON"
-            final_response = final_response.replace("[[SHOW_WAITER_BUTTON]]", "").strip()
-        elif waiter_mode_active and not is_done:
-            signal = "WAITER_ACTIVE"
+                # Parse structured response
+                pr_m = re.search(r'PROVIDER_REPLY:\s*(.+?)(?=USER_SUMMARY:|SIGNAL:|$)', content, re.DOTALL | re.IGNORECASE)
+                us_m = re.search(r'USER_SUMMARY:\s*(.+?)(?=SIGNAL:|$)', content, re.DOTALL | re.IGNORECASE)
+                sg_m = re.search(r'SIGNAL:\s*(\w+)', content, re.IGNORECASE)
 
-        if is_done and "WORK_DONE" not in final_response:
-            final_response += " WORK_DONE"
+                provider_reply = pr_m.group(1).strip() if pr_m else "ठीक है, धन्यवाद।"
+                user_summary   = us_m.group(1).strip() if us_m else "Provider replied."
+                signal         = sg_m.group(1).strip().upper() if sg_m else "NONE"
+                print(f"[AGENT] ✓ Parsed LLM output:")
+                print(f"  - provider_reply: {provider_reply}")
+                print(f"  - user_summary: {user_summary}")
+                print(f"  - signal: {signal}")
+            except Exception as llm_err:
+                print(f"[AGENT] ✗✗✗ LLM ERROR ✗✗✗")
+                print(f"[AGENT] Error type: {type(llm_err).__name__}")
+                print(f"[AGENT] Error message: {llm_err}")
+                import traceback
+                traceback.print_exc()
+                provider_reply = "ठीक है।"
+                user_summary   = f"Provider said: {waiter_speech}"
+                signal         = "SHOW_PLACEHOLDER_IMAGES" if food_items else "NONE"
+                print(f"[AGENT] Using fallback response")
 
-        # Persistence check for signal if tag not present (fallback)
-        if not signal and "check the menu with the waiter" in final_response.lower() and not waiter_mode_active:
-            signal = "SHOW_WAITER_BUTTON"
+            # Safety: if food found, always show images
+            if food_items and signal not in ("SHOW_PLACEHOLDER_IMAGES", "ORDER_DONE"):
+                signal = "SHOW_PLACEHOLDER_IMAGES"
 
-        if self.session_id in _session_store:
-            _session_store[self.session_id]["order_details"] = result.get(
-                "order_details", _session_store[self.session_id]["order_details"]
+            print(f"[AGENT] → Step 4: Update session store")
+            _session_store[self.session_id].update({
+                "food_options": food_options,
+                "waiter_lang":  waiter_lang,
+            })
+            print(f"[AGENT] ✓ Session updated")
+            
+            bot_response = f"PROVIDER_REPLY: {provider_reply}\nUSER_SUMMARY: {user_summary}"
+            print(f"\n[AGENT] ✓✓✓ CASE 3 COMPLETE - FINAL RESPONSE ✓✓✓")
+            print(f"  - provider_reply: {provider_reply}")
+            print(f"  - user_summary: {user_summary}")
+            print(f"  - signal: {signal}")
+            print(f"  - food_options: {food_options}")
+            print(f"  - waiter_lang: {waiter_lang}")
+            print("#"*80 + "\n")
+            return bot_response, "pending", food_options, waiter_lang, signal
+
+        # ── CASE 4: User selected a food item ────────────────────────────────
+        if action == "user_selection" and selected_item:
+            print(f"[AGENT] DETERMINISTIC user_selection: {selected_item}")
+            _session_store[self.session_id]["selected_item"] = selected_item
+
+            lang_names = {"hi": "Hindi", "en": "English", "ta": "Tamil", "kn": "Kannada"}
+            lang_name  = lang_names.get(waiter_lang, "the detected language")
+
+            system = f"""You are an AI mediator. The deaf user selected '{selected_item}'.
+Ask the provider for price and preparation time in {lang_name}.
+Reply in EXACTLY this format:
+PROVIDER_REPLY: <ask about price and time in {lang_name}>
+USER_SUMMARY: I've asked the provider about {selected_item}. Waiting for details.
+SIGNAL: NONE"""
+
+            response     = await asyncio.to_thread(
+                llm.invoke,
+                [SystemMessage(content=system), HumanMessage(content=f"User selected: {selected_item}")]
             )
-            _session_store[self.session_id]["is_done"] = is_done
-            _session_store[self.session_id]["food_options"] = food_options
-            _session_store[self.session_id]["waiter_lang"] = waiter_lang
+            content      = response.content.strip()
+            pr_m         = re.search(r'PROVIDER_REPLY:\s*(.+?)(?=USER_SUMMARY:|SIGNAL:|$)', content, re.DOTALL | re.IGNORECASE)
+            provider_reply = pr_m.group(1).strip() if pr_m else f"Customer wants {selected_item}. What is the price and preparation time?"
+            user_summary   = f"I've asked the provider about {selected_item}. Waiting for details."
+            signal         = "NONE"
+            bot_response   = f"PROVIDER_REPLY: {provider_reply}\nUSER_SUMMARY: {user_summary}"
+            return bot_response, "pending", food_options, waiter_lang, signal
 
-        status = "done" if is_done else "pending"
-        return final_response, status, food_options, waiter_lang, signal
+        # ── Fallback ──────────────────────────────────────────────────────────
+        print("[AGENT] WARNING: No valid input matched, returning idle response")
+        return "PROVIDER_REPLY: [NONE]\nUSER_SUMMARY: Ready.", "pending", food_options, waiter_lang, "NONE"

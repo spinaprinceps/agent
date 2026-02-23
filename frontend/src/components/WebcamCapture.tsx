@@ -34,16 +34,20 @@ const WebcamCapture: React.FC<WebcamCaptureProps> = ({ onUpload, isProcessing })
     setRecordedChunks([]);
     setHasRecording(false);
     setCapturing(true);
-    setCountdown(8);
+    setCountdown(5);
 
     if (webcamRef.current?.stream) {
-      const recorder = new MediaRecorder(webcamRef.current.stream, { mimeType: 'video/webm' });
+      // Use lower quality for faster upload
+      const recorder = new MediaRecorder(webcamRef.current.stream, { 
+        mimeType: 'video/webm',
+        videoBitsPerSecond: 500000 // 500 kbps for smaller file size
+      });
       recorder.addEventListener('dataavailable', handleDataAvailable);
       recorder.addEventListener('stop', () => setHasRecording(true));
       mediaRecorderRef.current = recorder;
       recorder.start();
 
-      let secs = 8;
+      let secs = 5;
       countdownRef.current = setInterval(() => {
         secs -= 1;
         setCountdown(secs);
@@ -52,7 +56,7 @@ const WebcamCapture: React.FC<WebcamCaptureProps> = ({ onUpload, isProcessing })
         }
       }, 1000);
 
-      setTimeout(() => handleStopCaptureClick(), 8000);
+      setTimeout(() => handleStopCaptureClick(), 5000);
     }
   }, [handleDataAvailable, handleStopCaptureClick]);
 
